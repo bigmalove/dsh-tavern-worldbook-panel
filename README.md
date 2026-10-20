@@ -8,12 +8,15 @@
 
 这个仓库独立于 `dsh-tavern` 本体，也不参与它的发布清单——本体只负责加载 `plugins/` 下的目录，插件代码不进本体的提交历史。
 
+仓库地址：https://github.com/bigmalove/dsh-tavern-worldbook-panel
+
 ## 装
 
 复制整个文件夹到 Tavern 数据目录的 `plugins/`（目录名必须是英文包名）：
 
 ```sh
-git clone <本仓库> ~/.dsh-tavern/profile-data/tavern/data/plugins/dsh-tavern-worldbook-panel
+git clone https://github.com/bigmalove/dsh-tavern-worldbook-panel \
+  ~/.dsh-tavern/profile-data/tavern/data/plugins/dsh-tavern-worldbook-panel
 ```
 
 或者直接拷贝现成的目录：
