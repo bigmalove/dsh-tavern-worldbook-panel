@@ -6,15 +6,25 @@
 
 界面上露出的名字是「加强版世界书」：侧栏开始页「插件」分组里的卡片、右侧栏页标题、顶栏按钮提示都用它。包名仍是 `dsh-tavern-worldbook-panel`（Tavern 按包名生成插件 id，不能带中文）。
 
+这个仓库独立于 `dsh-tavern` 本体，也不参与它的发布清单——本体只负责加载 `plugins/` 下的目录，插件代码不进本体的提交历史。
+
 ## 装
 
-复制整个文件夹到 Tavern 数据目录的 `plugins/`：
+复制整个文件夹到 Tavern 数据目录的 `plugins/`（目录名必须是英文包名）：
+
+```sh
+git clone <本仓库> ~/.dsh-tavern/profile-data/tavern/data/plugins/dsh-tavern-worldbook-panel
+```
+
+或者直接拷贝现成的目录：
 
 ```sh
 cp -r dsh-tavern-worldbook-panel ~/.dsh-tavern/profile-data/tavern/data/plugins/
 ```
 
 不重启也能生效：宿主侧几秒内加载，浏览器侧刷新一次页面出现。删掉文件夹即卸载。
+
+`client.js` 已随仓库提供，装的时候不需要构建。
 
 ## 用法
 
@@ -54,8 +64,9 @@ cp -r dsh-tavern-worldbook-panel ~/.dsh-tavern/profile-data/tavern/data/plugins/
 ## 开发
 
 ```sh
-node build.mjs        # src/panel.js + src/panel.css → client.js
-node --test tests/panel.test.mjs
+npm install              # 只装 react / react-dom / jsdom（跑测试用）
+npm run build            # src/panel.js + src/panel.css → client.js
+npm test                 # jsdom + 真 React 跑面板
 ```
 
-`client.js` 是产物，不要手改；改 `src/panel.js`（与 Tavern 的 `features/worldbook-switcher.js` 同源）后重新构建。
+提交前记得 `npm run build`：`client.js` 是产物，但仓库里要跟着源码一起更新，装的人才不用构建。

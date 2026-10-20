@@ -8,6 +8,15 @@
     ".": "./index.mjs",
     "./client": "./client.js"
   },
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test tests/panel.test.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "26.1.0",
+    "react": "19.2.0",
+    "react-dom": "19.2.0"
+  },
   "dsh": {
     "client": {
       "platform": "web",
