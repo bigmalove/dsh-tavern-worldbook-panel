@@ -12,6 +12,14 @@
 
 ## 装
 
+**方式一：Tavern 里一键安装（推荐）**
+
+设置 → DSH Tavern → 插件 → 粘贴 `https://github.com/bigmalove/dsh-tavern-worldbook-panel` → 安装 → 刷新页面。连不上 GitHub 时，在仓库页下载 ZIP，同一处点「上传 ZIP」。
+
+插件没有运行时 npm 依赖：面板用的 React 由 Tavern 的模块加载器提供，`client.js` 已随仓库提交，装的时候不需要 `npm install`，也不需要构建。`package.json` 里因此不写 `dependencies`（Tavern 的一键安装看到非空 `dependencies` 会拒绝）。
+
+**方式二：手动复制**
+
 复制整个文件夹到 Tavern 数据目录的 `plugins/`（目录名必须是英文包名）：
 
 ```sh

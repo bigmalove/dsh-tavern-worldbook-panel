@@ -1,6 +1,6 @@
 {
   "name": "dsh-tavern-worldbook-panel",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "加强版世界书：换书、开关条目、详情、大窗编辑、查找替换、常用条目与文件夹。",
@@ -10,12 +10,20 @@
   },
   "scripts": {
     "build": "node build.mjs",
-    "test": "node --test tests/panel.test.mjs"
+    "test": "node --test tests/panel.test.mjs tests/packaging.test.mjs"
   },
   "devDependencies": {
     "jsdom": "26.1.0",
     "react": "19.2.0",
     "react-dom": "19.2.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bigmalove/dsh-tavern-worldbook-panel.git"
+  },
+  "homepage": "https://github.com/bigmalove/dsh-tavern-worldbook-panel#readme",
+  "bugs": {
+    "url": "https://github.com/bigmalove/dsh-tavern-worldbook-panel/issues"
   },
   "dsh": {
     "client": {
