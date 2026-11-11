@@ -305,3 +305,41 @@ test('插件：注册侧栏页，页内是嵌入形态的完整面板（「插�
 		dom.window.close()
 	}
 })
+
+// 人物卡内置的世界书属于它那张卡：换到别的卡的对局里就不该看见。
+test('插件：内置世界书跟着本局会话的卡走', async () => {
+	const handlersOf = scoped => ({
+		listWorldBooks: () => Object.assign({
+			standalone: [{ kind: 'standalone', path: 'worldbooks/常用.json', name: '常用世界', globalEnabled: true, entryCount: 1, enabledCount: 1, diagnostics: 0, importedAt: 0, updatedAt: 0 }],
+			embedded: [
+				{ kind: 'card', cardPath: 'cards/阿珂.png', name: '阿珂世界书', cardName: '阿珂', entryCount: 1, enabledCount: 1 },
+				{ kind: 'card', cardPath: 'cards/小白.png', name: '小白世界书', cardName: '小白', entryCount: 1, enabledCount: 1 },
+			],
+			diagnostics: [],
+		}, scoped ? { sessionCardPath: 'cards/阿珂.png' } : {}),
+		getWorldBook: body => ({
+			source: body.source, globalEnabled: true,
+			view: { displayName: '常用世界', scanDepth: 2, entries: [ENTRY_CONSTANT] },
+		}),
+	})
+	async function listedBookNames(scoped) {
+		const { dom, React, triggerEntry, restore } = await boot(handlersOf(scoped))
+		try {
+			const { document } = await openPanel(React, triggerEntry, dom, 'session-3')
+			const allButton = Array.from(document.querySelectorAll('.dsh-wbp-icon')).find(node => node.getAttribute('title') === '全部世界书')
+			assert.ok(allButton, '应有「全部世界书」入口')
+			await React.act(async () => { allButton.click() })
+			for (let attempt = 0; attempt < 20 && !document.querySelector('.dsh-wbp-book-row'); attempt++) {
+				await React.act(async () => { await tick() })
+			}
+			return Array.from(document.querySelectorAll('.dsh-wbp-book-row .dsh-wbp-row-name')).map(node => node.textContent).sort()
+		} finally {
+			restore()
+			dom.window.close()
+		}
+	}
+	// 宿主带回本局的卡：只列这张卡的内置书，别家卡的书留到它们自己的会话。
+	assert.deepEqual(await listedBookNames(true), ['常用世界', '阿珂世界书'].sort())
+	// 宿主没给会话卡（旧版 Tavern）：保持原样，一本都不藏。
+	assert.deepEqual(await listedBookNames(false), ['小白世界书', '常用世界', '阿珂世界书'].sort())
+})

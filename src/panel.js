@@ -247,13 +247,19 @@ function createWorldBookSwitcherFeatureModule() {
 		const standalone = (result && Array.isArray(result.standalone) ? result.standalone : []).map(function (row) {
 			return Object.assign({}, row, { key: "standalone:" + row.path, source: { kind: "standalone", path: row.path }, embedded: false });
 		});
-		const embedded = (result && Array.isArray(result.embedded) ? result.embedded : []).map(function (row) {
+		const embeddedRows = (result && Array.isArray(result.embedded) ? result.embedded : []).map(function (row) {
 			return Object.assign({}, row, { key: "card:" + row.cardPath, source: { kind: "card", cardPath: row.cardPath }, embedded: true });
 		});
+		// 人物卡内置的世界书属于它那张卡：只有本局当前这张卡的那本带过来，
+		// 别的卡的书要换到那张卡的会话才出现（要管理全部书走「完整」进世界书库）。
+		// 宿主没带回会话卡（旧版 Tavern、或这一局没有卡）时全部列出，不藏东西。
+		const scoped = Boolean(result && typeof result.sessionCardPath === "string");
+		const embedded = scoped ? embeddedRows.filter(row => row.cardPath === result.sessionCardPath) : embeddedRows;
 		return {
 			standalone: standalone,
 			embedded: embedded,
 			all: standalone.concat(embedded),
+			sessionCardPath: scoped ? result.sessionCardPath : "",
 			diagnostics: result && Array.isArray(result.diagnostics) ? result.diagnostics : []
 		};
 	}
@@ -1146,7 +1152,9 @@ function createWorldBookSwitcherFeatureModule() {
 			if (!frequentOpen || !catalog) return undefined;
 			let alive = true;
 			setFrequent(function (current) { return Object.assign({}, current, { loading: true }); });
-			const keys = new Set(Object.values(config.entryUsage || {}).map(item => item.book).filter(Boolean));
+			// 只统计当前列得出的书：别的卡的内置书不在这一局里，常用条目也不该翻出来。
+			const listed = new Set((catalog.all || []).map(row => row.key));
+			const keys = new Set(Object.values(config.entryUsage || {}).map(item => item.book).filter(book => book && listed.has(book)));
 			Promise.all(Array.from(keys).map(async function (key) {
 				if (bookCache.current.has(key)) return;
 				const source = wbSourceOfKey(key);
@@ -1172,7 +1180,7 @@ function createWorldBookSwitcherFeatureModule() {
 						count: item.count,
 						last: item.last
 					};
-				}).filter(item => !item.missing);
+				}).filter(item => listed.has(item.key)).filter(item => !item.missing);
 				entries.sort(function (left, right) {
 					if (left.pinned !== right.pinned) return left.pinned ? -1 : 1;
 					if (left.count !== right.count) return right.count - left.count;
