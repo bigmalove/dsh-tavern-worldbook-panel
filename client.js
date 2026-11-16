@@ -267,6 +267,125 @@ function createWorldBookSwitcherFeatureModule() {
 	let switcherState = { open: false, anchor: null, rect: null, sessionId: "" };
 	const switcherListeners = new Set();
 
+	// ---- 跨挂载持久缓存 ----
+	// 浮层每次关闭都会卸载整个面板组件，useState/useRef 跟着归零：目录、当前书、
+	// 书正文全丢，于是每次点开都先闪「正在读取世界书…」再等几秒。
+	// 缓存放在实例闭包里（不是 window）：插件重载拿一份干净的，多个面板共享同一份，
+	// 测试里每次 register 也天然隔离。
+	const WB_BOOK_CACHE_LIMIT = 12;
+	// 旧版服务端会忽略 summaryOnly/ifRevision，把整本书再传一遍：认出这种服务端后
+	// 就别每次打开都去要一次（一本书 2~18MB，手机上很贵）。
+	const WB_LEGACY_REVALIDATE_MS = 600000;
+	const wbCache = {
+		catalogBySession: new Map(),
+		catalog: null,
+		books: new Map(),
+		catalogInflight: new Map(),
+		fullInflight: new Map()
+	};
+
+	function wbCacheCatalogSet(sessionId, catalog) {
+		if (!catalog) return;
+		wbCache.catalog = catalog;
+		const key = String(sessionId || "");
+		if (key) wbCache.catalogBySession.set(key, catalog);
+	}
+
+	function wbCacheCatalogGet(sessionId) {
+		const key = String(sessionId || "");
+		return (key ? wbCache.catalogBySession.get(key) : null) || wbCache.catalog || null;
+	}
+
+	// 宿主 summaryOnly 的条目长这样：content 保留空串（旧面板调 includes 不炸）+ contentOmitted。
+	function wbEntryNeedsContent(entry) {
+		if (!entry) return false;
+		return entry.contentOmitted === true || typeof entry.content !== "string";
+	}
+
+	// 条目正文不在 = 这份 record 是 summaryOnly 拉的元信息；凡是要正文的动作都得补全。
+	function wbRecordNeedsHydration(record) {
+		if (!record) return true;
+		if (record.summaryOnly === true || record.contentOmitted === true) return true;
+		const entries = record.view && Array.isArray(record.view.entries) ? record.view.entries : null;
+		if (!entries) return true;
+		return entries.some(wbEntryNeedsContent);
+	}
+
+	function wbCacheBookItem(bookKey) {
+		const key = String(bookKey || "");
+		if (!key) return null;
+		const item = wbCache.books.get(key);
+		if (!item) return null;
+		// LRU：读过就挪到队尾，淘汰时先掉最久没碰的那本。
+		wbCache.books.delete(key);
+		wbCache.books.set(key, item);
+		return item;
+	}
+
+	function wbCachedRecord(bookKey) {
+		const item = wbCacheBookItem(bookKey);
+		return item ? item.record : null;
+	}
+
+	function wbCacheBookSet(bookKey, record, summaryOnly, legacy) {
+		const key = String(bookKey || "");
+		if (!key || !record || typeof record !== "object") return null;
+		const previous = wbCache.books.get(key);
+		const item = {
+			record: record,
+			summaryOnly: summaryOnly === undefined ? wbRecordNeedsHydration(record) : summaryOnly === true,
+			legacy: legacy === undefined ? Boolean(previous && previous.legacy) : legacy === true,
+			stamp: Date.now()
+		};
+		wbCache.books.delete(key);
+		wbCache.books.set(key, item);
+		while (wbCache.books.size > WB_BOOK_CACHE_LIMIT) {
+			const oldest = wbCache.books.keys().next().value;
+			if (oldest === undefined || oldest === key) break;
+			wbCache.books.delete(oldest);
+		}
+		return item;
+	}
+
+	function wbPickCatalogRow(catalog, selectedKey) {
+		const all = catalog && Array.isArray(catalog.all) ? catalog.all : [];
+		if (!all.length) return null;
+		return all.find(function (row) { return row.key === selectedKey; }) ||
+			all.find(function (row) { return !row.embedded && row.globalEnabled === true; }) ||
+			all[0];
+	}
+
+	function wbPatchCatalogRow(catalog, bookKey, patch) {
+		if (!catalog || !bookKey) return catalog;
+		const replace = function (row) { return row.key === bookKey ? Object.assign({}, row, patch) : row; };
+		return Object.assign({}, catalog, {
+			all: (catalog.all || []).map(replace),
+			standalone: (catalog.standalone || []).map(replace),
+			embedded: (catalog.embedded || []).map(replace)
+		});
+	}
+
+	// 条目开关的乐观更新：直接改缓存里的那份 record，界面不用等 RPC 回来。
+	function wbPatchCachedEntry(bookKey, ref, patch) {
+		const item = wbCacheBookItem(bookKey);
+		const record = item && item.record;
+		if (!record || !record.view || !Array.isArray(record.view.entries)) return null;
+		let hit = false;
+		const entries = record.view.entries.map(function (entry) {
+			if (!entry || entry.ref !== ref) return entry;
+			hit = true;
+			return Object.assign({}, entry, patch);
+		});
+		if (!hit) return null;
+		const view = Object.assign({}, record.view, {
+			entries: entries,
+			enabledCount: entries.filter(function (entry) { return entry && entry.enabled !== false; }).length
+		});
+		const next = Object.assign({}, record, { view: view });
+		wbCacheBookSet(bookKey, next, item.summaryOnly);
+		return next;
+	}
+
 	function publishSwitcher(next) {
 		switcherState = Object.assign({}, switcherState, next);
 		for (const listener of Array.from(switcherListeners)) {
@@ -325,12 +444,104 @@ function createWorldBookSwitcherFeatureModule() {
 		};
 	}
 
-	async function loadWbBook(sessionId, source) {
-		return await rpcWithTimeout("getWorldBook", { source: source }, sessionId);
+	// getWorldBook 的一层：只有真的指定的字段才进请求体（旧版服务端会忽略它们）。
+	async function loadWbBook(sessionId, source, options) {
+		const opts = options || {};
+		const args = { source: source };
+		if (opts.ifRevision !== undefined && opts.ifRevision !== null) args.ifRevision = opts.ifRevision;
+		if (opts.summaryOnly) args.summaryOnly = true;
+		return await rpcWithTimeout("getWorldBook", args, sessionId);
 	}
 
-	async function patchWbEntry(sessionId, source, ref, patch) {
-		return await rpc("updateWorldBook", { source: source, update: { operations: [{ op: "update", ref: ref, patch: patch }] } }, sessionId);
+	// 极速拉取：有 revision 就带 ifRevision（服务端没变回 { unchanged: true }，零重绘），
+	// 首屏与常用聚合带 summaryOnly（新版只回条目元信息，省掉 2~18MB 正文；旧版忽略未知字段）。
+	async function fetchWbBook(sessionId, row, options) {
+		const opts = options || {};
+		if (!row || !row.source) return null;
+		const cached = wbCacheBookItem(row.key);
+		const args = {};
+		if (opts.summaryOnly) args.summaryOnly = true;
+		if (cached && cached.record && cached.record.revision !== undefined && cached.record.revision !== null) {
+			// 要正文时不能带 ifRevision：revision 没变服务端只回 unchanged，正文就补不回来。
+			if (!opts.full || !wbRecordNeedsHydration(cached.record)) args.ifRevision = cached.record.revision;
+		}
+		const result = await loadWbBook(sessionId, row.source, args);
+		if (result && result.unchanged === true) return cached && cached.record ? cached.record : null;
+		return result || null;
+	}
+
+	async function loadBookSummary(sessionId, row, options) {
+		if (!row || !row.key) return null;
+		const cached = wbCacheBookItem(row.key);
+		if (cached && cached.record && !wbRecordNeedsHydration(cached.record) && !(options && options.force)) return cached.record;
+		const record = await fetchWbBook(sessionId, row, { summaryOnly: true });
+		if (record) {
+			// 要了 summaryOnly 却拿回完整正文 = 旧版服务端忽略了未知字段，记下来少打扰它。
+			wbCacheBookSet(row.key, record, undefined, !wbRecordNeedsHydration(record));
+		}
+		return record;
+	}
+
+	// 按需补正文：同一本书并发触发只发一次（详情、编辑器、查找替换、搜索都会喊它）。
+	function hydrateWbBook(sessionId, bookKey, source) {
+		const key = String(bookKey || "");
+		const cached = wbCacheBookItem(key);
+		if (cached && cached.record && !wbRecordNeedsHydration(cached.record)) return Promise.resolve(cached.record);
+		if (!source) return Promise.resolve(cached ? cached.record : null);
+		const running = wbCache.fullInflight.get(key);
+		if (running) return running;
+		const task = (async function () {
+			const record = await fetchWbBook(sessionId, { key: key, source: source }, { full: true });
+			if (record) wbCacheBookSet(key, record);
+			return record;
+		})();
+		wbCache.fullInflight.set(key, task);
+		return task.finally(function () { wbCache.fullInflight.delete(key); });
+	}
+
+	// 目录 + 默认书的 single-flight：手指碰到图标就抢跑，面板打开复用同一个 Promise。
+	function prefetchCatalogAndDefaultBook(sessionId, selectedKey) {
+		const sessionKey = String(sessionId || "");
+		const running = wbCache.catalogInflight.get(sessionKey);
+		if (running) return running;
+		const task = (async function () {
+			const catalog = await loadWbCatalog(sessionId);
+			wbCacheCatalogSet(sessionId, catalog);
+			const row = wbPickCatalogRow(catalog, selectedKey);
+			if (!row) return { catalog: catalog, row: null, record: null, fromCache: false, bookError: null };
+			const cached = wbCacheBookItem(row.key);
+			if (cached && cached.record) return { catalog: catalog, row: row, record: cached.record, fromCache: true, bookError: null };
+			let record = null;
+			let bookError = null;
+			try { record = await loadBookSummary(sessionId, row); } catch (err) { bookError = err; }
+			return { catalog: catalog, row: row, record: record, fromCache: false, bookError: bookError };
+		})();
+		wbCache.catalogInflight.set(sessionKey, task);
+		task.catch(function () {}).finally(function () { wbCache.catalogInflight.delete(sessionKey); });
+		return task;
+	}
+
+	// 悬停/按下顶栏按钮时的轻量预热：已有目录且默认书也在缓存里就什么都不做。
+	function prefetchWorldBookSwitcher(sessionId) {
+		const key = String(sessionId || "");
+		if (!key) return null;
+		const running = wbCache.catalogInflight.get(key);
+		if (running) return running;
+		const cachedCatalog = wbCacheCatalogGet(key);
+		if (cachedCatalog) {
+			const row = wbPickCatalogRow(cachedCatalog, readWbSwitcherConfig().selectedKey);
+			if (row && wbCachedRecord(row.key)) return null;
+		}
+		const task = prefetchCatalogAndDefaultBook(key, readWbSwitcherConfig().selectedKey);
+		task.catch(function () {});
+		return task;
+	}
+
+	async function patchWbEntry(sessionId, source, ref, patch, options) {
+		const args = { source: source, update: { operations: [{ op: "update", ref: ref, patch: patch }] } };
+		// lean：新版服务端只回 { revision, globalEnabled, lean: true }，不再回整本书。
+		if (!options || options.lean !== false) args.lean = true;
+		return await rpc("updateWorldBook", args, sessionId);
 	}
 
 	async function deleteWbEntry(sessionId, source, ref) {
@@ -1068,9 +1279,21 @@ function createWorldBookSwitcherFeatureModule() {
 		const [config, setConfig] = React.useState(readWbSwitcherConfig);
 		const configRef = React.useRef(config);
 		configRef.current = config;
-		const [catalog, setCatalog] = React.useState(null);
-		const [book, setBook] = React.useState(null);
-		const [loading, setLoading] = React.useState(true);
+		// 首帧就用实例缓存铺满：命中过缓存的面板一打开就是完整下拉框 + 条目列表，
+		// loading 只在「手里真的一本书都没有」时才置真，绝不闪「正在读取世界书…」。
+		const bootRef = React.useRef(null);
+		if (!bootRef.current) {
+			const bootCatalog = wbCacheCatalogGet(sessionId);
+			const bootRow = wbPickCatalogRow(bootCatalog, config.selectedKey);
+			const bootRecord = bootRow ? wbCachedRecord(bootRow.key) : null;
+			bootRef.current = { catalog: bootCatalog, row: bootRow, record: bootRecord || null };
+		}
+		const boot = bootRef.current;
+		const [catalog, setCatalog] = React.useState(boot.catalog);
+		const [book, setBook] = React.useState(function () {
+			return boot.record && boot.row ? Object.assign({}, boot.record, { key: boot.row.key, row: boot.row }) : null;
+		});
+		const [loading, setLoading] = React.useState(!(boot.record && boot.row));
 		const [error, setError] = React.useState("");
 		const [pane, setPane] = React.useState(null);
 		const [allOpen, setAllOpen] = React.useState(false);
@@ -1083,7 +1306,8 @@ function createWorldBookSwitcherFeatureModule() {
 		const [mobile, setMobile] = React.useState(function () { return window.innerWidth < 768; });
 		const [geometry, setGeometry] = React.useState(null);
 		const rootRef = React.useRef(null);
-		const bookCache = React.useRef(new Map());
+		// 乐观更新把目录换掉后，后台静默刷新的旧结果不许再覆盖回去。
+		const catalogToken = React.useRef(0);
 		// 设置与文件夹是临时面板：关掉后回到打开前的详情。
 		const paneReturn = React.useRef(null);
 
@@ -1105,19 +1329,66 @@ function createWorldBookSwitcherFeatureModule() {
 			writeWbSwitcherConfig(next);
 		}
 
+		// 换书：缓存里有这本就 0ms 直上，网络只做后台校验（ifRevision 命中就是零字节重绘）。
 		async function selectRow(row, sourceCatalog) {
 			const pool = sourceCatalog || catalog;
 			if (!pool || !row) return;
 			setError("");
+			const cached = wbCachedRecord(row.key);
+			if (cached) {
+				setBook(Object.assign({}, cached, { key: row.key, row: row }));
+				setQuery("");
+				updateConfig({ selectedKey: row.key });
+				refreshBookQuietly(row);
+				return;
+			}
+			setLoading(true);
 			try {
-				const record = await loadWbBook(sessionId, row.source);
-				bookCache.current.set(row.key, record);
+				const record = await loadBookSummary(sessionId, row);
+				if (!record) return;
 				setBook(Object.assign({}, record, { key: row.key, row: row }));
 				setQuery("");
 				updateConfig({ selectedKey: row.key });
 			} catch (err) {
 				setError(String(err && err.message || err));
+			} finally {
+				setLoading(false);
 			}
+		}
+
+		// 后台静默校验：带 ifRevision 只花几百字节；旧版服务端已认出，十分钟内不再打扰它。
+		function refreshBookQuietly(row) {
+			if (!row || !row.key) return;
+			const cached = wbCacheBookItem(row.key);
+			if (cached && cached.legacy && Date.now() - (cached.stamp || 0) < WB_LEGACY_REVALIDATE_MS) return;
+			loadBookSummary(sessionId, row, { force: true }).then(function (record) {
+				if (!record) return;
+				const now = wbCacheBookItem(row.key);
+				if (now && now.record && now.record.view === record.view && now.record.revision === record.revision) return;
+				applyBookRecord(row.key, record);
+			}).catch(function () {});
+		}
+
+		// 需要正文的动作（详情 / 编辑器 / 查找替换 / 搜索）统一走这里补全。
+		function hydrateBook(bookKey, options) {
+			const key = bookKey || (book ? book.key : "");
+			if (!key) return Promise.resolve(null);
+			const cached = wbCacheBookItem(key);
+			if (cached && cached.record && !wbRecordNeedsHydration(cached.record) && !(options && options.force)) return Promise.resolve(cached.record);
+			const source = wbSourceOfKey(key);
+			if (!source) return Promise.resolve(cached ? cached.record : null);
+			return hydrateWbBook(sessionId, key, source).then(function (record) {
+				if (!record) return null;
+				applyBookRecord(key, record);
+				// 详情页在补拉完成前显示「正在读取条目…」，这里是它的刷新点（书可能不是当前这本）。
+				setPane(function (current) {
+					return current && current.kind === "detail" && current.bookKey === key ? Object.assign({}, current) : current;
+				});
+				return record;
+			}).catch(function (err) {
+				setError(String(err && err.message || err));
+				return null;
+			});
 		}
 
 		React.useEffect(function () {
@@ -1130,18 +1401,37 @@ function createWorldBookSwitcherFeatureModule() {
 			setPane(null);
 			setEditor(null);
 			setQuery("");
-			setLoading(true);
-			loadWbCatalog(sessionId).then(async function (next) {
-				if (!alive) return;
-				setCatalog(next);
-				const row = next.all.find(item => item.key === initial.selectedKey) || next.all.find(item => item.globalEnabled === true) || next.all[0];
-				if (!row) { setBook(null); setLoading(false); return; }
-				const record = await loadWbBook(sessionId, row.source);
-				if (!alive) return;
-				bookCache.current.set(row.key, record);
-				setBook(Object.assign({}, record, { key: row.key, row: row }));
-				if (!initial.selectedKey) updateConfig({ selectedKey: row.key });
+			// 先按实例缓存把界面铺满；只有在缓存里连一本书都没有时才进 loading。
+			const cachedCatalog = wbCacheCatalogGet(sessionId);
+			const cachedRow = wbPickCatalogRow(cachedCatalog, initial.selectedKey);
+			const cachedRecord = cachedRow ? wbCachedRecord(cachedRow.key) : null;
+			if (cachedCatalog) setCatalog(cachedCatalog);
+			if (cachedRecord && cachedRow) {
+				setBook(Object.assign({}, cachedRecord, { key: cachedRow.key, row: cachedRow }));
 				setLoading(false);
+			} else {
+				setLoading(true);
+			}
+			// 后台静默刷新：预热可能已经发出同一个请求，single-flight 保证不双发。
+			prefetchCatalogAndDefaultBook(sessionId, initial.selectedKey).then(function (snap) {
+				if (!alive || !snap) return;
+				setCatalog(snap.catalog);
+				const row = snap.row;
+				if (!row) { setBook(null); setLoading(false); return; }
+				if (!initial.selectedKey) updateConfig({ selectedKey: row.key });
+				if (!snap.record) {
+					if (snap.bookError) setError(String(snap.bookError && snap.bookError.message || snap.bookError));
+					setLoading(false);
+					return;
+				}
+				const record = snap.record;
+				setBook(function (current) {
+					// 缓存里的对象没变（ifRevision 命中 unchanged）就原样返回：不重绘、不闪。
+					if (current && current.key === row.key && current.view === record.view && current.revision === record.revision) return current;
+					return Object.assign({}, record, { key: row.key, row: row });
+				});
+				setLoading(false);
+				if (snap.fromCache) refreshBookQuietly(row);
 			}).catch(function (err) {
 				if (!alive) return;
 				setError(String(err && err.message || err));
@@ -1216,16 +1506,17 @@ function createWorldBookSwitcherFeatureModule() {
 			// 只统计当前列得出的书：别的卡的内置书不在这一局里，常用条目也不该翻出来。
 			const listed = new Set((catalog.all || []).map(row => row.key));
 			const keys = new Set(Object.values(config.entryUsage || {}).map(item => item.book).filter(book => book && listed.has(book)));
+			// 常用聚合只要条目元信息：summaryOnly 拉，命中缓存的直接跳过。
 			Promise.all(Array.from(keys).map(async function (key) {
-				if (bookCache.current.has(key)) return;
+				if (wbCachedRecord(key)) return;
 				const source = wbSourceOfKey(key);
 				if (!source) return;
-				try { bookCache.current.set(key, await loadWbBook(sessionId, source)); } catch (_) {}
+				try { await loadBookSummary(sessionId, { key: key, source: source }); } catch (_) {}
 			})).then(function () {
 				if (!alive) return;
 				const pinned = new Set(config.pinnedEntries || []);
 				const entries = Object.entries(config.entryUsage || {}).map(function ([usageKey, item]) {
-					const record = bookCache.current.get(item.book);
+					const record = wbCachedRecord(item.book);
 					const view = record && record.view;
 					const entry = view && (view.entries || []).find(row => row.ref === item.ref);
 					const bookRow = (catalog.all || []).find(row => row.key === item.book);
@@ -1252,23 +1543,57 @@ function createWorldBookSwitcherFeatureModule() {
 			return function () { alive = false; };
 		}, [frequentOpen, catalog, config.entryUsage, config.pinnedEntries, sessionId]);
 
+		// 搜索要匹配正文：缓存只是 summaryOnly 时先补全，匹配结果才不会缺条目。
+		React.useEffect(function () {
+			if (!query.trim()) return undefined;
+			if (!book || !book.key) return undefined;
+			void hydrateBook(book.key);
+			return undefined;
+		}, [query, book && book.key]);
+
+		// 写回一本书：缓存 + 当前书 + 目录里的计数，一次搞定（详情/开关/补正文都走它）。
 		function applyBookRecord(bookKey, record) {
 			if (!record || !bookKey) return;
-			bookCache.current.set(bookKey, record);
-			if (book && book.key === bookKey) setBook(Object.assign({}, record, { key: bookKey, row: book.row }));
-			if (!catalog) return;
-			const replace = row => {
-				if (row.key !== bookKey) return row;
-				return Object.assign({}, row, {
-					entryCount: record.view ? record.view.entries.length : row.entryCount,
-					enabledCount: record.view ? record.view.entries.filter(entry => entry.enabled !== false).length : row.enabledCount
+			wbCacheBookSet(bookKey, record);
+			setBook(function (current) {
+				if (!current || current.key !== bookKey) return current;
+				return Object.assign({}, record, { key: bookKey, row: current.row });
+			});
+			setCatalog(function (current) {
+				if (!current) return current;
+				const replace = row => {
+					if (row.key !== bookKey) return row;
+					return Object.assign({}, row, {
+						entryCount: record.view && record.view.entries ? record.view.entries.length : row.entryCount,
+						enabledCount: record.view && record.view.entries ? record.view.entries.filter(entry => entry.enabled !== false).length : row.enabledCount
+					});
+				};
+				const next = Object.assign({}, current, {
+					all: (current.all || []).map(replace),
+					standalone: (current.standalone || []).map(replace),
+					embedded: (current.embedded || []).map(replace)
 				});
-			};
-			setCatalog(Object.assign({}, catalog, {
-				all: catalog.all.map(replace),
-				standalone: catalog.standalone.map(replace),
-				embedded: catalog.embedded.map(replace)
-			}));
+				wbCacheCatalogSet(sessionId, next);
+				return next;
+			});
+		}
+
+		// lean 写回：旧版服务端回整本书，新版只回 revision/lean 标记（正文用本地乐观值）。
+		function commitUpdate(bookKey, result) {
+			if (!result || !bookKey) return;
+			// 旧版非 lean 直接把书回在顶层（{ source, view, globalEnabled, revision }）；
+			// 有的路径包在 record/worldBook 里，都认。
+			const record = result.view ? result
+				: (result.record && result.record.view ? result.record
+					: (result.worldBook && result.worldBook.view ? result.worldBook : null));
+			if (record) { applyBookRecord(bookKey, record); return; }
+			if (result.revision === undefined && result.lean !== true) return;
+			const item = wbCacheBookItem(bookKey);
+			if (!item || !item.record) return;
+			const next = Object.assign({}, item.record, {
+				revision: result.revision !== undefined ? result.revision : item.record.revision
+			});
+			wbCacheBookSet(bookKey, next, item.summaryOnly);
 		}
 
 		function recordUsage(bookKey, entry) {
@@ -1280,22 +1605,31 @@ function createWorldBookSwitcherFeatureModule() {
 			updateConfig({ entryUsage: Object.fromEntries(trimmed) });
 		}
 
+		// 条目开关：先乐观翻（0ms），再 lean 写回；失败回滚到翻转前的快照。
 		async function toggleEntry(entry, next) {
 			if (!book || !entry) return;
-			recordUsage(book.key, entry);
+			const bookKey = book.key;
+			const source = book.source;
+			recordUsage(bookKey, entry);
+			const snapshot = wbCacheBookItem(bookKey);
+			const optimistic = wbPatchCachedEntry(bookKey, entry.ref, { enabled: next });
+			if (optimistic) applyBookRecord(bookKey, optimistic);
 			try {
-				applyBookRecord(book.key, await patchWbEntry(sessionId, book.source, entry.ref, { enabled: next }));
+				const result = await patchWbEntry(sessionId, source, entry.ref, { enabled: next });
+				commitUpdate(bookKey, result);
 				notifyTavernDataChanged(["worldbooks"], "worldbook-switcher");
 			} catch (err) {
+				if (snapshot && snapshot.record) applyBookRecord(bookKey, snapshot.record);
 				setError(String(err && err.message || err));
 			}
 		}
 
+		// 详情/设置/编辑器里的改动：必须拿回整本书，所以这里不用 lean。
 		async function patchEntryOf(bookKey, entry, patchValue) {
 			const source = wbSourceOfKey(bookKey);
 			if (!source) throw new Error("世界书不存在");
-			const record = await patchWbEntry(sessionId, source, entry.ref, patchValue);
-			applyBookRecord(bookKey, record);
+			const record = await patchWbEntry(sessionId, source, entry.ref, patchValue, { lean: false });
+			commitUpdate(bookKey, record);
 			notifyTavernDataChanged(["worldbooks"], "worldbook-switcher");
 			return record;
 		}
@@ -1303,15 +1637,23 @@ function createWorldBookSwitcherFeatureModule() {
 		async function toggleFrequentEntry(entry, next) {
 			const source = wbSourceOfKey(entry.key);
 			if (!source) return;
-			try {
-				recordUsage(entry.key, { ref: entry.ref, title: entry.name });
-				const record = await patchWbEntry(sessionId, source, entry.ref, { enabled: next });
-				applyBookRecord(entry.key, record);
-				setFrequent(function (current) {
-					return Object.assign({}, current, { entries: current.entries.map(item => item.id === entry.id ? Object.assign({}, item, { enabled: next }) : item) });
+			recordUsage(entry.key, { ref: entry.ref, title: entry.name });
+			const snapshot = wbCacheBookItem(entry.key);
+			const optimistic = wbPatchCachedEntry(entry.key, entry.ref, { enabled: next });
+			if (optimistic) applyBookRecord(entry.key, optimistic);
+			const flipRow = enabled => function (current) {
+				return Object.assign({}, current, {
+					entries: current.entries.map(item => item.id === entry.id ? Object.assign({}, item, { enabled: enabled }) : item)
 				});
+			};
+			setFrequent(flipRow(next));
+			try {
+				const result = await patchWbEntry(sessionId, source, entry.ref, { enabled: next });
+				commitUpdate(entry.key, result);
 				notifyTavernDataChanged(["worldbooks"], "worldbook-switcher");
 			} catch (err) {
+				if (snapshot && snapshot.record) applyBookRecord(entry.key, snapshot.record);
+				setFrequent(flipRow(!next));
 				setError(String(err && err.message || err));
 			}
 		}
@@ -1321,7 +1663,7 @@ function createWorldBookSwitcherFeatureModule() {
 			if (!source || !entry) return;
 			try {
 				const record = await deleteWbEntry(sessionId, source, entry.ref);
-				applyBookRecord(bookKey, record);
+				commitUpdate(bookKey, record);
 				const usage = Object.assign({}, configRef.current.entryUsage);
 				delete usage[wbEntryKey(bookKey, entry.ref)];
 				const pinnedEntries = (configRef.current.pinnedEntries || []).filter(item => item !== wbEntryKey(bookKey, entry.ref));
@@ -1333,18 +1675,51 @@ function createWorldBookSwitcherFeatureModule() {
 			}
 		}
 
+		// 开启/关闭世界书：开关 0ms 翻，选中态立刻跟着换（都用缓存），RPC 只做 lean 落盘。
+		// 原先这里串行等三个重型 RPC（setGlobalWorldBook 全量 + listWorldBooks + getWorldBook），
+		// 手机上要卡好几秒。
 		async function toggleWorldbook(row, next) {
 			if (!row || row.embedded) return;
-			try {
-				await rpc("setGlobalWorldBook", { source: row.source, enabled: next }, sessionId);
-				const refreshed = await loadWbCatalog(sessionId);
-				setCatalog(refreshed);
-				if (!refreshed.all.some(item => item.key === configRef.current.selectedKey)) {
-					const fallback = refreshed.all.find(item => item.globalEnabled === true) || refreshed.all[0];
-					if (fallback) await selectRow(fallback, refreshed);
+			setError("");
+			const previousCatalog = catalog;
+			const previousBook = book;
+			const token = catalogToken.current + 1;
+			catalogToken.current = token;
+			const optimistic = wbPatchCatalogRow(previousCatalog, row.key, { globalEnabled: next });
+			if (optimistic) {
+				setCatalog(optimistic);
+				wbCacheCatalogSet(sessionId, optimistic);
+			}
+			const currentKey = previousBook ? previousBook.key : "";
+			const enabledNow = (optimistic ? optimistic.standalone : []).some(item => item.key === currentKey && item.globalEnabled === true);
+			if (next === true && !enabledNow) {
+				// 这局之前一本启用的书都没有：下拉框立刻切到刚开的这本。
+				const target = (optimistic && optimistic.all ? optimistic.all : []).find(item => item.key === row.key) || row;
+				void selectRow(target, optimistic || previousCatalog);
+			} else if (next === false && currentKey === row.key) {
+				const fallback = (optimistic ? optimistic.standalone : []).find(item => item.globalEnabled === true && item.key !== row.key) || null;
+				if (fallback) void selectRow(fallback, optimistic || previousCatalog);
+				else {
+					setBook(null);
+					updateConfig({ selectedKey: "" });
+					setPane(function (current) { return current && current.kind === "detail" ? null : current; });
 				}
+			}
+			try {
+				await rpc("setGlobalWorldBook", { source: row.source, enabled: next, lean: true }, sessionId);
 				notifyTavernDataChanged(["worldbooks"], "worldbook-switcher");
+				// 后台静默对齐（目录很小）；期间用户又点了别的开关就别覆盖。
+				loadWbCatalog(sessionId).then(function (refreshed) {
+					if (catalogToken.current !== token) return;
+					wbCacheCatalogSet(sessionId, refreshed);
+					setCatalog(refreshed);
+				}).catch(function () {});
 			} catch (err) {
+				if (previousCatalog) {
+					setCatalog(previousCatalog);
+					wbCacheCatalogSet(sessionId, previousCatalog);
+				}
+				setBook(previousBook);
 				setError(String(err && err.message || err));
 			}
 		}
@@ -1354,6 +1729,7 @@ function createWorldBookSwitcherFeatureModule() {
 			try {
 				await rpc("deleteWorldBook", { source: row.source }, sessionId);
 				const refreshed = await loadWbCatalog(sessionId);
+				wbCacheCatalogSet(sessionId, refreshed);
 				setCatalog(refreshed);
 				if (book && book.key === row.key) {
 					const fallback = refreshed.all.find(item => item.globalEnabled === true) || refreshed.all[0];
@@ -1396,19 +1772,26 @@ function createWorldBookSwitcherFeatureModule() {
 
 		function openEntry(bookKey, entry) {
 			setPane({ kind: "detail", bookKey: bookKey, ref: entry.ref });
-			const record = bookCache.current.get(bookKey);
-			if (!record || !record.view) {
-				const source = wbSourceOfKey(bookKey);
-				if (!source) return;
-				loadWbBook(sessionId, source).then(function (loaded) {
-					if (!loaded) return;
-					bookCache.current.set(bookKey, loaded);
-					if (book && book.key === bookKey) applyBookRecord(bookKey, loaded);
-					setPane(function (current) { return current && current.kind === "detail" && current.bookKey === bookKey ? Object.assign({}, current) : current; });
-				}).catch(function (err) { setError(String(err && err.message || err)); });
+			// 详情要正文：缓存里是 summaryOnly 的元信息就先补全（single-flight，点几次只拉一次）。
+			void hydrateBook(bookKey);
+			if (!mobile) setTab("entries");
+		}
+
+		// 编辑器必须拿完整正文：没补全就先补全再开，别把空正文送进去。
+		function openEditor(bookKey, ref) {
+			const entryOf = function (record) {
+				const list = record && record.view && Array.isArray(record.view.entries) ? record.view.entries : [];
+				return list.find(function (item) { return item && item.ref === ref; }) || null;
+			};
+			const ready = entryOf(wbCachedRecord(bookKey));
+			if (ready && !wbEntryNeedsContent(ready)) {
+				setEditor({ bookKey: bookKey, entry: ready });
 				return;
 			}
-			if (!mobile) setTab("entries");
+			hydrateBook(bookKey).then(function (record) {
+				const entry = entryOf(record) || entryOf(wbCachedRecord(bookKey));
+				if (entry) setEditor({ bookKey: bookKey, entry: entry });
+			});
 		}
 
 		function openLibrary(current) {
@@ -1423,7 +1806,7 @@ function createWorldBookSwitcherFeatureModule() {
 			return [entry.title, entry.comment, entry.content].concat(entry.primaryKeys || [], entry.secondaryKeys || [])
 				.some(value => String(value || "").toLocaleLowerCase().includes(needle));
 		}) : allEntries;
-		const detailRecord = pane && pane.kind === "detail" ? (book && book.key === pane.bookKey ? book : bookCache.current.get(pane.bookKey)) : null;
+		const detailRecord = pane && pane.kind === "detail" ? (book && book.key === pane.bookKey ? book : wbCachedRecord(pane.bookKey)) : null;
 		const detailEntry = detailRecord && detailRecord.view ? (detailRecord.view.entries || []).find(entry => entry.ref === pane.ref) : null;
 
 		const selectable = (catalog ? catalog.standalone.filter(row => row.globalEnabled === true) : []).slice();
@@ -1451,7 +1834,9 @@ function createWorldBookSwitcherFeatureModule() {
 		}
 
 		function renderDetail(backLabel) {
-			if (!detailEntry || !detailRecord) {
+			// 元信息在、正文还没补回来：仍显示「正在读取条目…」，补完由 hydrateBook 触发重绘。
+			const contentPending = wbEntryNeedsContent(detailEntry);
+			if (!detailEntry || !detailRecord || contentPending) {
 				return h("div", { className: "dsh-wbp-column" },
 					h("div", { className: "dsh-wbp-head" }, h("span", { className: "dsh-wbp-title" }, "详情"),
 						h(WbIconButton, { name: backLabel ? "back" : "close", title: "关闭", onClick: function () { setPane(null); } })),
@@ -1466,7 +1851,7 @@ function createWorldBookSwitcherFeatureModule() {
 				onPatch: function (patchValue) { return patchEntryOf(pane.bookKey, detailEntry, patchValue); },
 				onDelete: function () { void removeEntry(pane.bookKey, detailEntry); },
 				onClose: function () { setPane(null); },
-				onExpand: function () { setEditor({ bookKey: pane.bookKey, entry: detailEntry }); }
+				onExpand: function () { openEditor(pane.bookKey, detailEntry.ref); }
 			});
 		}
 
@@ -1612,7 +1997,10 @@ function createWorldBookSwitcherFeatureModule() {
 			geometry && geometry.narrow ? renderMobile() : renderDesktop(),
 			editor ? h(WbFullscreenEditor, {
 				entry: editor.entry,
-				bookName: (bookCache.current.get(editor.bookKey) || book || {}).view ? (bookCache.current.get(editor.bookKey) || book).view.displayName : "",
+				bookName: (function () {
+					const record = wbCachedRecord(editor.bookKey) || book || null;
+					return record && record.view ? record.view.displayName : "";
+				})(),
 				onSave: function (patchValue) { return patchEntryOf(editor.bookKey, editor.entry, patchValue); },
 				onClose: function () { setEditor(null); }
 			}) : null);
@@ -1636,6 +2024,10 @@ function createWorldBookSwitcherFeatureModule() {
 		return function () {
 			try { root.unmount(); } catch (_) {}
 			container.remove();
+			// 插件卸载（禁用/热重载）时把整份缓存还回去；开关浮层不会走到这里。
+			wbCache.catalogBySession.clear();
+			wbCache.books.clear();
+			wbCache.catalog = null;
 		};
 	}
 
@@ -1645,6 +2037,13 @@ function createWorldBookSwitcherFeatureModule() {
 		Panel: WorldBookSwitcherPanel,
 		open: openWorldBookSwitcher,
 		close: closeWorldBookSwitcher,
+		// 手指碰到顶栏按钮时的抢跑预热；clearCache 给插件卸载/测试兜底用。
+		prefetch: prefetchWorldBookSwitcher,
+		clearCache: function () {
+			wbCache.catalogBySession.clear();
+			wbCache.books.clear();
+			wbCache.catalog = null;
+		},
 		subscribe: subscribeSwitcher,
 		snapshot: snapshotSwitcher,
 		normalizeConfig: normalizeWbSwitcherConfig,
@@ -1672,6 +2071,8 @@ const worldBookSwitcherFeature = createWorldBookSwitcherFeatureModule();
         event.stopPropagation()
         props.open(event.currentTarget)
       }
+      // 手指碰到图标（还没点到）就先抢跑一次目录+默认书：手机上那几十毫秒不白等。
+      const prewarm = function () { if (props.prewarm) props.prewarm() }
       return h("button", {
         type: "button",
         className: "dsh-wbp-trigger",
@@ -1679,6 +2080,9 @@ const worldBookSwitcherFeature = createWorldBookSwitcherFeatureModule();
         "aria-label": PANEL_TITLE,
         "aria-haspopup": "dialog",
         onClick: onClick,
+        onPointerEnter: prewarm,
+        onPointerDown: prewarm,
+        onTouchStart: prewarm,
       }, h("svg", {
         width: 15, height: 15, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor",
         strokeWidth: 1.8, strokeLinecap: "round", strokeLinejoin: "round", "aria-hidden": "true",
@@ -1783,8 +2187,22 @@ const worldBookSwitcherFeature = createWorldBookSwitcherFeatureModule();
             if (!currentSessionId) return
             worldBookSwitcherFeature.open(anchor, currentSessionId)
           }
+          // 悬停/手指压到接管的那颗按钮上时抢跑一次（面板打开会复用同一个 in-flight Promise）。
+          function onHover(event) {
+            const target = event.target
+            if (!target || typeof target.closest !== "function") return
+            if (!target.closest(CORE_ITEM)) return
+            if (!currentSessionId) return
+            worldBookSwitcherFeature.prefetch(currentSessionId)
+          }
           document.addEventListener("click", onPointerDown, true)
-          return function () { document.removeEventListener("click", onPointerDown, true) }
+          document.addEventListener("pointerover", onHover, true)
+          document.addEventListener("touchstart", onHover, true)
+          return function () {
+            document.removeEventListener("click", onPointerDown, true)
+            document.removeEventListener("pointerover", onHover, true)
+            document.removeEventListener("touchstart", onHover, true)
+          }
         }
 
         if (slots) {
@@ -1799,6 +2217,7 @@ const worldBookSwitcherFeature = createWorldBookSwitcherFeatureModule();
                 // 只有确认那个按钮不在了才露出自己的图标，避免同一位置两个入口。
                 return React.createElement(WorldBookPanelTrigger, {
                   open: function (node) { worldBookSwitcherFeature.open(node, currentSessionId) },
+                  prewarm: function () { worldBookSwitcherFeature.prefetch(currentSessionId) },
                 })
               }
             )

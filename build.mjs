@@ -94,6 +94,8 @@ ${panel}
         event.stopPropagation()
         props.open(event.currentTarget)
       }
+      // 手指碰到图标（还没点到）就先抢跑一次目录+默认书：手机上那几十毫秒不白等。
+      const prewarm = function () { if (props.prewarm) props.prewarm() }
       return h("button", {
         type: "button",
         className: "dsh-wbp-trigger",
@@ -101,6 +103,9 @@ ${panel}
         "aria-label": PANEL_TITLE,
         "aria-haspopup": "dialog",
         onClick: onClick,
+        onPointerEnter: prewarm,
+        onPointerDown: prewarm,
+        onTouchStart: prewarm,
       }, h("svg", {
         width: 15, height: 15, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor",
         strokeWidth: 1.8, strokeLinecap: "round", strokeLinejoin: "round", "aria-hidden": "true",
@@ -205,8 +210,22 @@ ${panel}
             if (!currentSessionId) return
             worldBookSwitcherFeature.open(anchor, currentSessionId)
           }
+          // 悬停/手指压到接管的那颗按钮上时抢跑一次（面板打开会复用同一个 in-flight Promise）。
+          function onHover(event) {
+            const target = event.target
+            if (!target || typeof target.closest !== "function") return
+            if (!target.closest(CORE_ITEM)) return
+            if (!currentSessionId) return
+            worldBookSwitcherFeature.prefetch(currentSessionId)
+          }
           document.addEventListener("click", onPointerDown, true)
-          return function () { document.removeEventListener("click", onPointerDown, true) }
+          document.addEventListener("pointerover", onHover, true)
+          document.addEventListener("touchstart", onHover, true)
+          return function () {
+            document.removeEventListener("click", onPointerDown, true)
+            document.removeEventListener("pointerover", onHover, true)
+            document.removeEventListener("touchstart", onHover, true)
+          }
         }
 
         if (slots) {
@@ -221,6 +240,7 @@ ${panel}
                 // 只有确认那个按钮不在了才露出自己的图标，避免同一位置两个入口。
                 return React.createElement(WorldBookPanelTrigger, {
                   open: function (node) { worldBookSwitcherFeature.open(node, currentSessionId) },
+                  prewarm: function () { worldBookSwitcherFeature.prefetch(currentSessionId) },
                 })
               }
             )

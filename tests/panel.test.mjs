@@ -343,3 +343,222 @@ test('插件：内置世界书跟着本局会话的卡走', async () => {
 	// 宿主没给会话卡（旧版 Tavern）：保持原样，一本都不藏。
 	assert.deepEqual(await listedBookNames(false), ['小白世界书', '常用世界', '阿珂世界书'].sort())
 })
+
+// ---- 热点路径：跨挂载缓存、ifRevision、summaryOnly 补正文、乐观开关 ----
+// 可控服务端：能按住读/写响应，用来证明「缓存命中 0ms」与「乐观更新不等 RPC」。
+function stubServer(options = {}) {
+	const conf = Object.assign({ enabled: false, revision: 7, failWrite: false, failToggle: false }, options)
+	const state = {
+		holdReads: false, holdWrites: false, holdToggles: false,
+		readBodies: [], writeBodies: [], setBodies: [],
+		pendingReads: [], pendingWrites: [], pendingToggles: [],
+	}
+	const recordOf = body => {
+		// 与宿主 worldBookViewForWire 的 summary 形态一致：content 留空串 + contentOmitted。
+		const entries = [ENTRY_CONSTANT, ENTRY_KEYWORD].map(entry => body && body.summaryOnly
+			? Object.assign({}, entry, { contentOmitted: true, content: '', contentLength: entry.content.length })
+			: entry)
+		return {
+			source: body.source,
+			globalEnabled: conf.enabled,
+			revision: conf.revision,
+			summaryOnly: Boolean(body && body.summaryOnly),
+			view: { displayName: '王城世界', entryCount: entries.length, enabledCount: entries.length, scanDepth: 2, entries },
+		}
+	}
+	const handlers = {
+		listWorldBooks: () => ({
+			standalone: [{ kind: 'standalone', path: 'worldbooks/a.json', name: '王城世界', globalEnabled: conf.enabled, entryCount: 2, enabledCount: 2, diagnostics: 0, importedAt: 0, updatedAt: 0 }],
+			embedded: [],
+			diagnostics: [],
+		}),
+		getWorldBook: body => {
+			state.readBodies.push(body)
+			// 带 ifRevision 且 revision 没变：新版服务端只回 { unchanged: true }。
+			const payload = body && body.ifRevision === conf.revision ? { unchanged: true } : recordOf(body)
+			if (!state.holdReads) return payload
+			return new Promise(resolve => state.pendingReads.push(() => resolve(payload)))
+		},
+		updateWorldBook: body => {
+			state.writeBodies.push(body)
+			if (conf.failWrite) return Promise.reject(new Error('写回失败'))
+			const payload = { revision: conf.revision + 1, globalEnabled: conf.enabled, lean: true }
+			if (!state.holdWrites) return payload
+			return new Promise(resolve => state.pendingWrites.push(() => resolve(payload)))
+		},
+		setGlobalWorldBook: body => {
+			state.setBodies.push(body)
+			if (conf.failToggle) return Promise.reject(new Error('开关失败'))
+			const payload = { changed: true, lean: true }
+			if (!state.holdToggles) { conf.enabled = body.enabled === true; return payload }
+			return new Promise(resolve => state.pendingToggles.push(() => { conf.enabled = body.enabled === true; resolve(payload) }))
+		},
+	}
+	return {
+		state, handlers,
+		releaseReads() { state.holdReads = false; state.pendingReads.splice(0).forEach(run => run()) },
+		releaseWrites() { state.holdWrites = false; state.pendingWrites.splice(0).forEach(run => run()) },
+		releaseToggles() { state.holdToggles = false; state.pendingToggles.splice(0).forEach(run => run()) },
+	}
+}
+
+const bookWait = async (React, document, predicate) => {
+	for (let attempt = 0; attempt < 30; attempt++) {
+		if (predicate(document)) return true
+		await React.act(async () => { await tick() })
+	}
+	return predicate(document)
+}
+
+test('插件：关掉再点开命中实例缓存，0ms 出条目、不再闪「正在读取世界书…」', async () => {
+	const api = stubServer()
+	const { dom, React, triggerEntry, restore } = await boot(api.handlers)
+	try {
+		const { document, button } = await openPanel(React, triggerEntry, dom, 'session-cache')
+		assert.ok(document.querySelector('.dsh-wbp-row'), '首屏应列出条目')
+		assert.equal(document.body.textContent.includes('正在读取世界书'), false, '首屏加载完不该还留着加载提示')
+
+		// 关掉浮层 = 组件卸载；再点开时按住所有 getWorldBook：还依赖网络就不会有行。
+		await React.act(async () => { windowEvent(dom, 'keydown', { key: 'Escape' }) })
+		await React.act(async () => { await tick() })
+		assert.equal(document.querySelector('.dsh-wbp-shell'), null, 'Esc 应关闭面板')
+
+		api.state.holdReads = true
+		await React.act(async () => { button.click() })
+		assert.ok(document.querySelector('.dsh-wbp-shell'), '面板应立刻弹出')
+		assert.equal(document.body.textContent.includes('正在读取世界书'), false, '缓存命中时不该出现加载提示')
+		assert.ok(document.querySelectorAll('.dsh-wbp-row').length >= 2, '缓存命中应立刻有条目行')
+
+		// 后台仍会静默校验，但只花 ifRevision 的几百字节。
+		api.releaseReads()
+		await bookWait(React, document, () => api.state.readBodies.some(body => body.ifRevision === 7))
+		assert.ok(api.state.readBodies.some(body => body.ifRevision === 7 && body.summaryOnly === true), '重开校验应带 ifRevision + summaryOnly，实际：' + JSON.stringify(api.state.readBodies))
+		assert.ok(!document.querySelector('.dsh-wbp-error'), 'unchanged 不该报错')
+		assert.ok(document.querySelectorAll('.dsh-wbp-row').length >= 2, 'unchanged 后条目仍在')
+	} finally {
+		restore()
+		dom.window.close()
+	}
+})
+
+test('插件：首屏用 summaryOnly 拉元信息，点开详情自动补全正文', async () => {
+	const api = stubServer()
+	const { dom, React, triggerEntry, restore } = await boot(api.handlers)
+	try {
+		const { document } = await openPanel(React, triggerEntry, dom, 'session-hydrate')
+		assert.ok(api.state.readBodies.some(body => body.summaryOnly === true), '首屏应请求 summaryOnly 元信息')
+
+		api.state.holdReads = true
+		await React.act(async () => { document.querySelector('.dsh-wbp-row').click() })
+		assert.ok(document.querySelector('.dsh-wbp-shell').textContent.includes('正在读取条目'), '正文补回前详情应显示「正在读取条目…」')
+		assert.ok(api.state.readBodies.some(body => body.summaryOnly !== true), '点详情应触发一次完整 getWorldBook')
+
+		api.releaseReads()
+		const shown = await bookWait(React, document, node => node.querySelector('.dsh-wbp-shell').textContent.includes('王城位于大陆中央'))
+		assert.ok(shown, '补全后详情应显示正文，实际：' + document.querySelector('.dsh-wbp-shell').textContent.slice(0, 160))
+	} finally {
+		restore()
+		dom.window.close()
+	}
+})
+
+test('插件：搜索框一有内容就把 summaryOnly 的书补成完整正文', async () => {
+	const api = stubServer()
+	const { dom, React, triggerEntry, restore } = await boot(api.handlers)
+	try {
+		const { document } = await openPanel(React, triggerEntry, dom, 'session-search')
+		const fullBefore = api.state.readBodies.filter(body => body.summaryOnly !== true).length
+		const input = document.querySelector('.dsh-wbp-search')
+		await React.act(async () => {
+			const setter = Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, 'value').set
+			setter.call(input, '雨季')
+			input.dispatchEvent(new dom.window.Event('input', { bubbles: true }))
+		})
+		const fetched = await bookWait(React, document, () => api.state.readBodies.filter(body => body.summaryOnly !== true).length > fullBefore)
+		assert.ok(fetched, '搜索应触发一次完整正文补拉')
+	} finally {
+		restore()
+		dom.window.close()
+	}
+})
+
+test('插件：条目开关 0ms 乐观翻转，lean 返回体不把开关翻回去', async () => {
+	const api = stubServer()
+	const { dom, React, triggerEntry, restore } = await boot(api.handlers)
+	try {
+		const { document } = await openPanel(React, triggerEntry, dom, 'session-toggle')
+		assert.equal(document.querySelector('.dsh-wbp-switch input').checked, true)
+		api.state.holdWrites = true
+		await React.act(async () => { document.querySelector('.dsh-wbp-switch input').click() })
+		assert.equal(document.querySelector('.dsh-wbp-switch input').checked, false, '开关应立即翻转，不等写回')
+		const write = api.state.writeBodies[api.state.writeBodies.length - 1]
+		assert.equal(write.lean, true, '写回应带 lean: true')
+		assert.equal(write.update.operations[0].patch.enabled, false)
+		api.releaseWrites()
+		await React.act(async () => { await tick() })
+		assert.equal(document.querySelector('.dsh-wbp-switch input').checked, false, 'lean 返回体不该把开关翻回去')
+		assert.equal(document.querySelector('.dsh-wbp-error'), null, 'lean 返回体不该报错')
+	} finally {
+		restore()
+		dom.window.close()
+	}
+})
+
+test('插件：写回失败时条目开关回滚并提示错误', async () => {
+	const api = stubServer({ failWrite: true })
+	const { dom, React, triggerEntry, restore } = await boot(api.handlers)
+	try {
+		const { document } = await openPanel(React, triggerEntry, dom, 'session-toggle-fail')
+		await React.act(async () => { document.querySelector('.dsh-wbp-switch input').click() })
+		const rolled = await bookWait(React, document, node => Boolean(node.querySelector('.dsh-wbp-error')))
+		assert.ok(rolled, '失败应提示错误')
+		assert.equal(document.querySelector('.dsh-wbp-switch input').checked, true, '失败应回滚到翻转前')
+	} finally {
+		restore()
+		dom.window.close()
+	}
+})
+
+test('插件：开启世界书 0ms 乐观生效（lean 写回），失败回滚', async () => {
+	const api = stubServer()
+	const { dom, React, triggerEntry, restore } = await boot(api.handlers)
+	try {
+		const { document } = await openPanel(React, triggerEntry, dom, 'session-worldbook')
+		const allButton = Array.from(document.querySelectorAll('.dsh-wbp-icon')).find(node => node.getAttribute('title') === '全部世界书')
+		await React.act(async () => { allButton.click() })
+		await bookWait(React, document, node => Boolean(node.querySelector('.dsh-wbp-book-row .dsh-wbp-switch input')))
+		assert.equal(document.querySelector('.dsh-wbp-book-row .dsh-wbp-switch input').checked, false)
+
+		api.state.holdToggles = true
+		await React.act(async () => { document.querySelector('.dsh-wbp-book-row .dsh-wbp-switch input').click() })
+		assert.equal(document.querySelector('.dsh-wbp-book-row .dsh-wbp-switch input').checked, true, '开关应立即生效，不等 setGlobalWorldBook')
+		const sent = api.state.setBodies[api.state.setBodies.length - 1]
+		assert.equal(sent.lean, true, '开启世界书应带 lean: true')
+		assert.equal(sent.enabled, true)
+		api.releaseToggles()
+		await React.act(async () => { await tick() })
+		await React.act(async () => { await tick() })
+		assert.equal(document.querySelector('.dsh-wbp-book-row .dsh-wbp-switch input').checked, true, '后台对齐后开关仍是开启')
+	} finally {
+		restore()
+		dom.window.close()
+	}
+})
+
+test('插件：开启世界书失败时回滚目录与开关', async () => {
+	const api = stubServer({ failToggle: true })
+	const { dom, React, triggerEntry, restore } = await boot(api.handlers)
+	try {
+		const { document } = await openPanel(React, triggerEntry, dom, 'session-worldbook-fail')
+		const allButton = Array.from(document.querySelectorAll('.dsh-wbp-icon')).find(node => node.getAttribute('title') === '全部世界书')
+		await React.act(async () => { allButton.click() })
+		await bookWait(React, document, node => Boolean(node.querySelector('.dsh-wbp-book-row .dsh-wbp-switch input')))
+		await React.act(async () => { document.querySelector('.dsh-wbp-book-row .dsh-wbp-switch input').click() })
+		const rolled = await bookWait(React, document, node => Boolean(node.querySelector('.dsh-wbp-error')))
+		assert.ok(rolled, '失败应提示错误')
+		assert.equal(document.querySelector('.dsh-wbp-book-row .dsh-wbp-switch input').checked, false, '失败应回滚开关')
+	} finally {
+		restore()
+		dom.window.close()
+	}
+})
